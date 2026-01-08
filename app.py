@@ -196,7 +196,7 @@ from abc import ABC, abstractmethod
 # Investigar FastApi, interesante
 # pip install uvicorn, fastapi, pandas, numpy...
 # crear venv...
-# lanzar con uvicorv app:app --reload
+# lanzar con uvicorn app:app --reload
 # Una vez funciona, vamos a al hosting: OnRender (free)
 #   - dashboard 
 #   - create project 
@@ -346,10 +346,109 @@ class GuessTargetLevel(GameLevel):
         # Score alto = mejor (invertimos el error)
         return max(0.0, 100.0 - result["error"])
 
+class RobustezR2Level(GameLevel):
+    id = "robust_r2"
+    name = "Robustez (R² bajo ruido)"
+    metric_order = ["r2_min", "r2_mean", "r2_std", "worst_noise", "n_used"]
+
+    def allowed_form(self, game: dict) -> dict:
+        level = game.get("complexity_level", 2) if game else 2
+        if level == 1:
+            return dict(model=False, anova=False, k=True, alpha=True)
+        return dict(model=True, anova=True, k=True, alpha=True)
+
+    def description_html(self) -> str:
+        return """
+        <div class="card">
+          <h3>Reto</h3>
+          <p>
+            Ajusta un modelo que funcione bien incluso cuando añadimos columnas de ruido.
+            El servidor lo prueba con varios <b>noise</b> y puntúa por tu rendimiento en el peor caso.
+          </p>
+          <p class="muted">
+            Métricas: r2_min (peor), r2_mean (media), r2_std (variación).<br>
+            Score = 0.7 * r2_min + 0.3 * r2_mean - 0.01 * k (si usas ANOVA).
+          </p>
+        </div>
+        """
+
+    def form_schema(self, game: dict) -> dict:
+        flags = self.allowed_form(game)
+
+        seed = str((game["game_id"] * 1337) if game else 1337)
+
+        return {
+            "model": {"type": "select", "choices": ["ridge", "lasso"], "enabled": flags["model"], "default": "ridge"},
+            "anova": {"type": "select", "choices": [("1", "Sí"), ("0", "No")], "enabled": flags["anova"], "default": "1"},
+            "k": {"type": "int", "enabled": flags["k"], "default": "10"},
+            "alpha": {"type": "float", "enabled": flags["alpha"], "default": "1.0"},
+            "seed": {"type": "int", "enabled": False, "default": seed},
+        }
+
+    def run(self, config: dict) -> dict:
+        model = config.get("model", "ridge")
+        anova = int(config.get("anova", 1))
+        k = int(config.get("k", 10))
+        alpha = float(config.get("alpha", 1.0))
+        seed = int(config.get("seed", 1337))
+        noises = [0, 20, 40, 80]
+
+        steps = [("imp", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]
+
+        n_used = k if anova else None
+
+        model_obj = Ridge(alpha=alpha) if model == "ridge" else Lasso(alpha=alpha, max_iter=20000)
+
+        r2_by_noise = {}
+        for n in noises:
+            Xn = add_noise(X_base, n, seed=seed + n * 101)
+
+            local_steps = list(steps)
+
+            if anova:
+                n_used_eff = min(k, Xn.shape[1])
+                local_steps.append(("anova", SelectKBest(f_regression, k=n_used_eff)))
+            else:
+                n_used_eff = Xn.shape[1]
+
+            pipe = Pipeline(local_steps + [("model", model_obj)])
+
+            X_train, X_test, y_train, y_test = train_test_split(
+                Xn, y, test_size=0.25, random_state=seed
+            )
+            pipe.fit(X_train, y_train)
+            r2_by_noise[n] = float(pipe.score(X_test, y_test))
+
+        r2_vals = np.array(list(r2_by_noise.values()), dtype=float)
+        worst_idx = int(np.argmin(r2_vals))
+        worst_noise = noises[worst_idx]
+
+        if not anova:
+            n_used = add_noise(X_base, worst_noise, seed=seed + worst_noise * 101).shape[1]
+
+        return {
+            "r2_min": float(r2_vals.min()),
+            "r2_mean": float(r2_vals.mean()),
+            "r2_std": float(r2_vals.std()),
+            "worst_noise": int(worst_noise),
+            "n_used": int(n_used),
+            "model": model,
+            "anova": int(anova),
+            "k": int(k),
+            "alpha": float(alpha),
+        }
+
+    def score(self, result: dict) -> float:
+        base = 0.7 * result["r2_min"] + 0.3 * result["r2_mean"]
+        if result["anova"]:
+            base -= 0.01 * result["n_used"]
+        return float(base)
+
 
 LEVELS = {
     RegressionR2Level.id: RegressionR2Level(),
     GuessTargetLevel.id: GuessTargetLevel(),
+    RobustezR2Level.id: RobustezR2Level(),
 }
 
 def get_level(game: dict | None) -> GameLevel:
@@ -689,6 +788,9 @@ def admin():
   <option value="guess_target">
     Adivina el objetivo
   </option>
+  <option value="robust_r2">
+    Robustez (R² bajo ruido)
+  </option>
 </select>
 
 Nivel:
@@ -696,8 +798,6 @@ Nivel:
   <option value="1">Nivel 1</option>
   <option value="2" selected>Nivel 2</option>
 </select>
-
-
         Duración (min):
         <select name="duration_min">
           <option value="10">10</option>
